@@ -878,41 +878,70 @@ fn finalize_request<ResBody, E, ResExt>(
                 });
             }
 
-            // Build label superset by moving owned values where possible.
-            // `url_scheme_kv` and `method_kv` are cloned for the active-requests
-            // decrement; their underlying strings are typically `&'static str`
-            // so the clones are allocation-free.
-            let cap = 5
-                + route_kv_opt.is_some() as usize
-                + custom_request_attributes.len()
-                + custom_response_attributes.len();
-            let mut label_superset = Vec::with_capacity(cap);
-            label_superset.push(protocol_name_kv);
-            label_superset.push(protocol_version_kv);
-            label_superset.push(url_scheme_kv.clone());
-            label_superset.push(method_kv.clone());
-            label_superset.push(status_code_kv);
-            if let Some(route_kv) = route_kv_opt {
-                label_superset.push(route_kv);
+            let full_labelset: &[KeyValue];
+            // Optimize to avoid heap allocation when no custom attributes are defined.
+            // There are 6 standard attributes currently produced by this lib:
+            //   * network.protocol.name
+            //   * network.protocol.version,
+            //   * url.scheme
+            //   * http.request.method,
+            //   * http.response.status_code
+            //   * http.route (conditional) - may be None depending on RouteExtractor impl.
+            const STD_ATTR_COUNT_MAX: usize = 6;
+            let std_attr_count = STD_ATTR_COUNT_MAX - usize::from(route_kv_opt.is_none());
+
+            let _stack_labelset: [KeyValue; STD_ATTR_COUNT_MAX]; // Stack-allocate for standard attribute set.
+            let mut _heap_labelset: Vec<KeyValue>; // Will not heap allocate unless used.
+            let only_std_attrs =
+                custom_request_attributes.is_empty() && custom_response_attributes.is_empty();
+
+            // Build full label set by moving owned values where possible.
+            // Labels re-used for recording active_requests are cloned;
+            // these attrs are typically `&'static str` so the clones are allocation-free.
+            if only_std_attrs {
+                _stack_labelset = [
+                    protocol_name_kv,
+                    protocol_version_kv,
+                    url_scheme_kv.clone(),
+                    method_kv.clone(),
+                    status_code_kv,
+                    route_kv_opt.unwrap_or_else(|| KeyValue::new("", "")),
+                ];
+                full_labelset = &_stack_labelset[..std_attr_count]; // Slice out route_kv_opt if it was None
+            } else {
+                _heap_labelset = Vec::with_capacity(
+                    std_attr_count
+                        + custom_request_attributes.len()
+                        + custom_response_attributes.len(),
+                );
+                _heap_labelset.push(protocol_name_kv);
+                _heap_labelset.push(protocol_version_kv);
+                _heap_labelset.push(url_scheme_kv.clone());
+                _heap_labelset.push(method_kv.clone());
+                _heap_labelset.push(status_code_kv);
+                if let Some(route_kv) = route_kv_opt {
+                    _heap_labelset.push(route_kv);
+                }
+                // Move (do not clone) the custom attribute Vecs into the label set.
+                _heap_labelset.extend(custom_request_attributes);
+                _heap_labelset.extend(custom_response_attributes);
+                full_labelset = &_heap_labelset;
             }
-            // Move (not clone) the custom attribute Vecs into the label set.
-            label_superset.extend(custom_request_attributes);
-            label_superset.extend(custom_response_attributes);
 
             layer_state
                 .server_request_duration
-                .record(duration_start.elapsed().as_secs_f64(), &label_superset);
+                .record(duration_start.elapsed().as_secs_f64(), full_labelset);
 
             if let Some(req_content_length) = req_body_size {
                 layer_state
                     .server_request_body_size
-                    .record(req_content_length, &label_superset);
+                    .record(req_content_length, full_labelset);
             }
 
             if let Some(resp_content_length) = response.body().size_hint().exact() {
                 layer_state
                     .server_response_body_size
-                    .record(resp_content_length, &label_superset);
+                    .record(resp_content_length, full_labelset);
             }
 
             layer_state
