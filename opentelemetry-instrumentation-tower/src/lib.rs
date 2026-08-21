@@ -831,6 +831,86 @@ where
     }
 }
 
+/// Count of the standard metric attributes that this lib produces:
+///   * network.protocol.name
+///   * network.protocol.version
+///   * url.scheme
+///   * http.request.method
+///   * http.response.status_code
+///   * http.route (conditional) - may be None depending on RouteExtractor impl.
+const STD_ATTR_COUNT_MAX: usize = 6;
+
+/// Owns the metric label set so that a caller can borrow it as a slice.
+///
+/// A function cannot return a slice that points into its own stack frame.
+/// This type returns the storage instead, and the caller borrows it.
+///
+/// `Stack` holds the standard attributes inline and makes no heap allocation.
+/// It also holds the count, because the route label is optional.
+/// `Heap` holds the standard attributes and the custom attributes.
+// The `Stack` variant is large by design.
+// A `Box` would add back the heap allocation that this type removes.
+#[allow(clippy::large_enum_variant)]
+enum LabelSet {
+    Stack([KeyValue; STD_ATTR_COUNT_MAX], usize),
+    Heap(Vec<KeyValue>),
+}
+
+impl std::ops::Deref for LabelSet {
+    type Target = [KeyValue];
+
+    fn deref(&self) -> &[KeyValue] {
+        match self {
+            // Slice out the route slot if there was no route.
+            Self::Stack(attrs, count) => &attrs[..*count],
+            Self::Heap(attrs) => attrs,
+        }
+    }
+}
+
+/// Builds the full metric label set from the standard and custom attributes.
+///
+/// The label set stays on the stack when the caller defines no custom attributes.
+/// This is the common case, and it makes no heap allocation.
+fn build_labelset(
+    std_attrs: [KeyValue; STD_ATTR_COUNT_MAX - 1],
+    route_kv_opt: Option<KeyValue>,
+    custom_request_attributes: Vec<KeyValue>,
+    custom_response_attributes: Vec<KeyValue>,
+) -> LabelSet {
+    let std_attr_count = std_attrs.len() + usize::from(route_kv_opt.is_some());
+
+    if custom_request_attributes.is_empty() && custom_response_attributes.is_empty() {
+        let [protocol_name_kv, protocol_version_kv, url_scheme_kv, method_kv, status_code_kv] =
+            std_attrs;
+        // A Rust array must be full, so a missing route gets a placeholder.
+        // `LabelSet` owns all 6 values and drops all 6, so the placeholder does not leak.
+        // The count keeps the placeholder out of the label set.
+        return LabelSet::Stack(
+            [
+                protocol_name_kv,
+                protocol_version_kv,
+                url_scheme_kv,
+                method_kv,
+                status_code_kv,
+                route_kv_opt.unwrap_or_else(|| KeyValue::new("", "")),
+            ],
+            std_attr_count,
+        );
+    }
+
+    let mut attrs = Vec::with_capacity(
+        std_attr_count + custom_request_attributes.len() + custom_response_attributes.len(),
+    );
+    // Arrays and `Option` are both iterators, so these move the values in.
+    attrs.extend(std_attrs);
+    attrs.extend(route_kv_opt);
+    // Move (do not clone) the custom attribute Vecs into the label set.
+    attrs.extend(custom_request_attributes);
+    attrs.extend(custom_response_attributes);
+    LabelSet::Heap(attrs)
+}
+
 /// Finalizes the request by updating the span and recording metrics after the response is received.
 fn finalize_request<ResBody, E, ResExt>(
     result: &result::Result<http::Response<ResBody>, E>,
@@ -878,70 +958,35 @@ fn finalize_request<ResBody, E, ResExt>(
                 });
             }
 
-            let full_labelset: &[KeyValue];
-            // Optimize to avoid heap allocation when no custom attributes are defined.
-            // There are 6 standard attributes currently produced by this lib:
-            //   * network.protocol.name
-            //   * network.protocol.version,
-            //   * url.scheme
-            //   * http.request.method,
-            //   * http.response.status_code
-            //   * http.route (conditional) - may be None depending on RouteExtractor impl.
-            const STD_ATTR_COUNT_MAX: usize = 6;
-            let std_attr_count = STD_ATTR_COUNT_MAX - usize::from(route_kv_opt.is_none());
-
-            let _stack_labelset: [KeyValue; STD_ATTR_COUNT_MAX]; // Stack-allocate for standard attribute set.
-            let mut _heap_labelset: Vec<KeyValue>; // Will not heap allocate unless used.
-            let only_std_attrs =
-                custom_request_attributes.is_empty() && custom_response_attributes.is_empty();
-
-            // Build full label set by moving owned values where possible.
             // Labels re-used for recording active_requests are cloned;
             // these attrs are typically `&'static str` so the clones are allocation-free.
-            if only_std_attrs {
-                _stack_labelset = [
+            let full_labelset = build_labelset(
+                [
                     protocol_name_kv,
                     protocol_version_kv,
                     url_scheme_kv.clone(),
                     method_kv.clone(),
                     status_code_kv,
-                    route_kv_opt.unwrap_or_else(|| KeyValue::new("", "")),
-                ];
-                full_labelset = &_stack_labelset[..std_attr_count]; // Slice out route_kv_opt if it was None
-            } else {
-                _heap_labelset = Vec::with_capacity(
-                    std_attr_count
-                        + custom_request_attributes.len()
-                        + custom_response_attributes.len(),
-                );
-                _heap_labelset.push(protocol_name_kv);
-                _heap_labelset.push(protocol_version_kv);
-                _heap_labelset.push(url_scheme_kv.clone());
-                _heap_labelset.push(method_kv.clone());
-                _heap_labelset.push(status_code_kv);
-                if let Some(route_kv) = route_kv_opt {
-                    _heap_labelset.push(route_kv);
-                }
-                // Move (do not clone) the custom attribute Vecs into the label set.
-                _heap_labelset.extend(custom_request_attributes);
-                _heap_labelset.extend(custom_response_attributes);
-                full_labelset = &_heap_labelset;
-            }
+                ],
+                route_kv_opt,
+                custom_request_attributes,
+                custom_response_attributes,
+            );
 
             layer_state
                 .server_request_duration
-                .record(duration_start.elapsed().as_secs_f64(), full_labelset);
+                .record(duration_start.elapsed().as_secs_f64(), &full_labelset);
 
             if let Some(req_content_length) = req_body_size {
                 layer_state
                     .server_request_body_size
-                    .record(req_content_length, full_labelset);
+                    .record(req_content_length, &full_labelset);
             }
 
             if let Some(resp_content_length) = response.body().size_hint().exact() {
                 layer_state
                     .server_response_body_size
-                    .record(resp_content_length, full_labelset);
+                    .record(resp_content_length, &full_labelset);
             }
 
             layer_state
