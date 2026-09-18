@@ -103,6 +103,7 @@
 //! Fedora Linux 44 (Workstation Edition), rustc 1.97.1, OpenTelemetry 0.32.
 //!
 
+use alloc_tracker::{Allocator, Session};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use opentelemetry::global;
 use opentelemetry::trace::noop::NoopTracerProvider;
@@ -111,10 +112,14 @@ use opentelemetry_sdk::{
     metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider},
     trace::{Sampler, SdkTracerProvider},
 };
+use std::cell::Cell;
 use std::convert::Infallible;
 use std::hint::black_box;
 use std::time::Duration;
 use tower::{Service, ServiceBuilder, ServiceExt};
+
+#[global_allocator]
+static ALLOCATOR: Allocator<std::alloc::System> = Allocator::system();
 
 /// Minimal handler — returns an empty body to keep baseline noise as low as possible.
 async fn handler(_req: http::Request<String>) -> Result<http::Response<String>, Infallible> {
@@ -172,13 +177,22 @@ fn benchmark_http_server(c: &mut Criterion) {
     let mut group = c.benchmark_group("tower-http-server");
     group.throughput(Throughput::Elements(1));
 
+    // The default report includes peak bytes, which this benchmark's span design
+    // cannot measure meaningfully (see `print_allocation_summary`). Suppress the
+    // default stdout table and JSON files, and print a table without that column.
+    let session = &Session::new().no_stdout().no_file();
+
     // Scenario 1: Baseline - no middleware
     group.bench_function(BenchmarkId::new("request", "baseline"), |b| {
         let mut service = tower::service_fn(handler);
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("baseline");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -186,6 +200,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 2: Middleware present, but both tracer and meter are no-ops.
@@ -201,9 +216,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer)
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("noop");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -211,6 +230,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 3: Tracing only (global meter not set, so meter instruments are no-op)
@@ -221,9 +241,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("tracing");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -231,6 +255,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 4: Tracing, request target with a query string that holds no
@@ -242,9 +267,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("tracing-query");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123?fields=name&verbose=true"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -252,6 +281,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 5: Tracing, request target with a query string that holds a
@@ -263,9 +293,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("tracing-query-redacted");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123?fields=name&sig=secret-signature"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -273,6 +307,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 6: Tracing with AlwaysOff sampler (global meter not set, so meter instruments are no-op)
@@ -283,9 +318,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("tracing-sampled-out");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -293,6 +332,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 7: Metrics only (tracer reset to NoopTracerProvider)
@@ -304,9 +344,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("metrics");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -314,6 +358,7 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
 
     // Scenario 8: Both tracing + metrics
@@ -325,9 +370,13 @@ fn benchmark_http_server(c: &mut Criterion) {
             .layer(layer.clone())
             .service(tower::service_fn(handler));
         rt.block_on(service.ready()).unwrap();
+        let operation = session.operation("tracing+metrics");
+        let iterations = Cell::new(0_u64);
+        let span = operation.measure_thread();
         b.to_async(&rt).iter_batched(
             || build_request("http://example.com/users/123"),
             |req| {
+                iterations.set(iterations.get() + 1);
                 let response = service.call(req);
                 async move {
                     black_box(response.await.unwrap());
@@ -335,7 +384,29 @@ fn benchmark_http_server(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+        drop(span.iterations(iterations.get()));
     });
+
+    print_allocation_summary(session);
+}
+
+fn print_allocation_summary(session: &Session) {
+    let report = session.to_report();
+    let mut operations: Vec<_> = report.operations().collect();
+    operations.sort_by_key(|(name, _)| *name);
+
+    println!("\nAllocation statistics (peak bytes omitted; see doc comment above):\n");
+    println!("| Operation              | Bytes/iter | Allocations/iter |");
+    println!("|-------------------------|------------|-------------------|");
+    for (name, operation) in operations {
+        let bytes = operation
+            .bytes()
+            .map_or_else(|| "n/a".to_string(), |value| format!("{value:.2}"));
+        let allocations = operation
+            .allocations()
+            .map_or_else(|| "n/a".to_string(), |value| format!("{value:.2}"));
+        println!("| {name:<23} | {bytes:>10} | {allocations:>17} |");
+    }
 }
 
 criterion_group!(benches, benchmark_http_server);
