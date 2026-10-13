@@ -1,0 +1,228 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 111b1aa8..b78447c7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,7 @@ resolver = "2"
+ debug = 1
+ 
+ [workspace.dependencies]
++
+ opentelemetry = "0.32"
+ opentelemetry-appender-tracing = "0.32"
+ opentelemetry-http = "0.32"
+@@ -41,6 +42,7 @@ opentelemetry-stdout = { version = "0.32", default-features = false }
+ opentelemetry-semantic-conventions = { version = "0.32", features = [
+     "semconv_experimental",
+ ] }
++alloc_tracker = { version = "0.7.10", default-features = false }
+ criterion = "0.8"
+ 
+ [workspace.lints.rust]
+diff --git a/opentelemetry-instrumentation-tower/Cargo.toml b/opentelemetry-instrumentation-tower/Cargo.toml
+index e5d13bdb..6e2e7046 100644
+--- a/opentelemetry-instrumentation-tower/Cargo.toml
++++ b/opentelemetry-instrumentation-tower/Cargo.toml
+@@ -28,6 +28,7 @@ tower-service = { version = "0.3", default-features = false }
+ tower-layer = { version = "0.3", default-features = false }
+ 
+ [dev-dependencies]
++alloc_tracker = { workspace = true, default-features = false }
+ criterion = { workspace = true, features = ["async_tokio"] }
+ opentelemetry_sdk = { workspace = true, features = ["metrics", "trace", "testing"] }
+ tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
+diff --git a/opentelemetry-instrumentation-tower/benches/http_server.rs b/opentelemetry-instrumentation-tower/benches/http_server.rs
+index 17122517..903db025 100644
+--- a/opentelemetry-instrumentation-tower/benches/http_server.rs
++++ b/opentelemetry-instrumentation-tower/benches/http_server.rs
+@@ -103,6 +103,7 @@
+ //! Fedora Linux 44 (Workstation Edition), rustc 1.97.1, OpenTelemetry 0.32.
+ //!
+ 
++use alloc_tracker::{Allocator, Session};
+ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+ use opentelemetry::global;
+ use opentelemetry::trace::noop::NoopTracerProvider;
+@@ -116,6 +117,9 @@ use std::hint::black_box;
+ use std::time::Duration;
+ use tower::{Service, ServiceBuilder, ServiceExt};
+ 
++#[global_allocator]
++static ALLOCATOR: Allocator<std::alloc::System> = Allocator::system();
++
+ /// Minimal handler — returns an empty body to keep baseline noise as low as possible.
+ async fn handler(_req: http::Request<String>) -> Result<http::Response<String>, Infallible> {
+     Ok(http::Response::new(String::new()))
+@@ -172,19 +176,24 @@ fn benchmark_http_server(c: &mut Criterion) {
+     let mut group = c.benchmark_group("tower-http-server");
+     group.throughput(Throughput::Elements(1));
+ 
++    let session = &Session::new();
++
+     // Scenario 1: Baseline - no middleware
+     group.bench_function(BenchmarkId::new("request", "baseline"), |b| {
+         let mut service = tower::service_fn(handler);
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("baseline");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -201,15 +210,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer)
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("noop");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -221,15 +233,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("tracing");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -242,15 +257,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("tracing-query");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123?fields=name&verbose=true"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -263,15 +281,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("tracing-query-redacted");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123?fields=name&sig=secret-signature"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -283,15 +304,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("tracing-sampled-out");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -304,15 +328,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("metrics");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ 
+@@ -325,15 +352,18 @@ fn benchmark_http_server(c: &mut Criterion) {
+             .layer(layer.clone())
+             .service(tower::service_fn(handler));
+         rt.block_on(service.ready()).unwrap();
++        let operation = session.operation("tracing+metrics");
+         b.to_async(&rt).iter_batched(
+             || build_request("http://example.com/users/123"),
+             |req| {
++                let span = operation.measure_thread();
+                 let response = service.call(req);
+                 async move {
+-                    black_box(response.await.unwrap());
++                    let response = black_box(response.await.unwrap());
++                    (response, span.iterations(1))
+                 }
+             },
+-            BatchSize::SmallInput,
++            BatchSize::PerIteration,
+         );
+     });
+ }

@@ -31,6 +31,7 @@ resolver = "2"
 debug = 1
 
 [workspace.dependencies]
+
 opentelemetry = "0.32"
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-http = "0.32"
@@ -41,6 +42,7 @@ opentelemetry-stdout = { version = "0.32", default-features = false }
 opentelemetry-semantic-conventions = { version = "0.32", features = [
     "semconv_experimental",
 ] }
+alloc_tracker = { version = "0.7.10", default-features = false }
 criterion = "0.8"
 
 [workspace.lints.rust]

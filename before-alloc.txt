@@ -1,0 +1,10 @@
+| Operation              | Bytes/iter | Allocations/iter | Peak bytes |
+|------------------------|------------|------------------|------------|
+| baseline               |          0 |                0 |          0 |
+| metrics                |     659.18 |                9 |     420.18 |
+| noop                   |        659 |                9 |        420 |
+| tracing                |       1219 |               10 |        996 |
+| tracing+metrics        |     1219.2 |               10 |      996.2 |
+| tracing-query          |       1243 |               11 |        995 |
+| tracing-query-redacted |       1283 |               12 |        987 |
+| tracing-sampled-out    |        883 |                9 |        644 |
